@@ -1,0 +1,908 @@
+#region Copyright
+///<remarks>
+/// <Graz Lagrangian Particle Dispersion Model>
+/// Copyright (C) [2019]  [Dietmar Oettl, Markus Kuntner]
+/// This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by
+/// the Free Software Foundation version 3 of the License
+/// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+/// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+/// You should have received a copy of the GNU General Public License along with this program.  If not, see <https://www.gnu.org/licenses/>.
+///</remarks>
+#endregion
+
+using System;
+using System.Threading.Tasks;
+
+namespace GRAL_2001
+{
+    class StartCoordinates
+    {
+        private const float RNG_Const = 2.328306435454494e-10F;
+        
+        /// <summary>
+        /// Calculate the start coordinates of all particles at a random point within the source geometries.
+        /// Calculates the "mass" of each particle, depending on the emission rate of the source and the number of particles per source.
+        /// Calculates the average deposition settings for each source group in the transient mode (used for the transient particles).
+        /// </summary>
+        public static void Calculate()
+        {
+            Calculate(1, Program.NTEILMAX + 1, Program.ParticlesPerReleaseStep > 0 ? Program.ParticlesPerReleaseStep : Program.NTEILMAX, 1f); //20260521
+        }
+
+        public static void Calculate(int globalStartInclusive, int globalEndExclusive, int localParticleCount, float emissionFactor) //20260521
+        {
+            /*
+             * 1) coordinates for source 1
+             * 2) coordinates for source 2
+             * 3) etc.
+             */
+            if (emissionFactor <= 0f || localParticleCount <= 0 || globalStartInclusive >= globalEndExclusive) //20260521
+            {
+                return;
+            }
+
+            int globalEnd = Math.Min(globalEndExclusive, globalStartInclusive + localParticleCount); //20260521
+            int capacity = Program.TotalParticleCapacity > 0 ? Program.TotalParticleCapacity : Program.NTEILMAX; //20260521
+            if (globalEnd - 1 > capacity) //20260521
+            {
+                throw new InvalidOperationException($"Transient particle release exceeds capacity: end={globalEnd - 1}, capacity={capacity}");
+            }
+
+            for (int i = 1; i <= Program.TS_Count; i++)
+            {
+                Program.TS_Width[i] = (float)Math.Max(0.1F,
+                    Math.Sqrt(Math.Pow(Program.TS_X1[i] - Program.TS_X2[i], 2) + Math.Pow(Program.TS_Y1[i] - Program.TS_Y2[i], 2)));
+                Program.TS_Height[i] = (float)Math.Max(0.1F,
+                    (Math.Max(Program.TS_Z1[i], Program.TS_Z2[i]) - Math.Min(Program.TS_Z1[i], Program.TS_Z2[i])));
+                Program.TS_cosalpha[i] = (float)((Program.TS_Y2[i] - Program.TS_Y1[i]) / Program.TS_Width[i]);
+                Program.TS_sinalpha[i] = (float)((Program.TS_X1[i] - Program.TS_X2[i]) / Program.TS_Width[i]);
+            }
+
+            double Volume_Time_Unit = 1000000000 / Program.GridVolume / 3600;
+            //SimpleRNG.SetSeed((uint)Environment.TickCount);
+            //瞬时释放控制20260310
+            bool[] vsReleaseThisStep = null;
+            if (Program.VS_Count > 0)
+            {
+                vsReleaseThisStep = new bool[Program.VS_Count + 1];
+                float tNowS = Math.Max(0f, (Program.IWET - Program.IWETstart) * Program.TAUS);
+
+                int activeNow = 0;
+                int instantNow = 0;
+
+                for (int isrc = 1; isrc <= Program.VS_Count; isrc++)
+                {
+                    bool releaseNow;
+                    if (Program.VS_Instant[isrc])
+                    {
+                        releaseNow = (!Program.VS_Released[isrc]) && (tNowS >= Program.VS_ReleaseTimeS[isrc]);
+                        if (releaseNow)
+                        {
+                            Program.VS_Released[isrc] = true;
+                            instantNow++;
+                        }
+                    }
+                    else
+                    {
+                        releaseNow = true;
+                    }
+
+                    vsReleaseThisStep[isrc] = releaseNow;
+                    if (releaseNow) activeNow++;
+                }
+
+                if (Program.IWET <= Program.IWETstart + 2 || instantNow > 0)
+                {
+                    Console.WriteLine($"[VS] IWET={Program.IWET} tNow={tNowS:F1}s active={activeNow}/{Program.VS_Count} instantNow={instantNow}");
+                }
+            }
+
+            Parallel.For(globalStartInclusive, globalEnd, Program.pOptions, nteil => //20260521
+            {
+                int localIndex = nteil - globalStartInclusive + 1; //20260521
+                //random number generator seeds
+                uint m_w;
+                uint m_z;
+                if (Program.UseFixedRndSeedVal)
+                {
+                    m_w = Program.RnGSeed.Seed1 + (uint)nteil;
+                    m_z = Program.RnGSeed.Seed2 + (uint)nteil * 2;
+                }
+                else
+                {
+                    int rnd = (Environment.TickCount + nteil) & Int32.MaxValue;
+                    m_w = (uint)(rnd + 521288629);
+                    m_z = (uint)(rnd + 2232121);
+                }
+
+                float zuff1 = DeterministicRng(ref m_z, ref m_w);
+                
+                float AHint = 0;
+
+                double sumanz = 0;
+                Program.ParticleSource[nteil] = 0; // marker if particle is not used
+
+                int caseswitch = Consts.SourceTypePoint; // Point Sources
+/*
+                if (nteil > (Program.PS_PartSum + Program.TS_PartSum + Program.LS_PartSum)) // >Line -> area sources
+                {
+                    caseswitch = Consts.SourceTypeArea;
+                }
+                else if (nteil > (Program.PS_PartSum + Program.TS_PartSum)) // > Portal -> Line sources
+                {
+                    caseswitch = Consts.SourceTypeLine;
+                }
+                else if (nteil > Program.PS_PartSum) // > Point Sources -> Portal
+                {
+                    caseswitch = Consts.SourceTypePortal;
+                }
+*/
+                int cutPS = Program.PS_PartSum;
+                int cutPS_TS = cutPS + Program.TS_PartSum;
+                int cutPS_TS_LS = cutPS_TS + Program.LS_PartSum;
+                int cutPS_TS_LS_AS = cutPS_TS_LS + Program.AS_PartSum;
+
+                if (localIndex > cutPS_TS_LS_AS) //20260521
+                {
+                    caseswitch = Consts.SourceTypeVolume;
+                }
+                else if (localIndex > cutPS_TS_LS) //20260521
+                {
+                    caseswitch = Consts.SourceTypeArea;
+                }
+                else if (localIndex > cutPS_TS) //20260521
+                {
+                    caseswitch = Consts.SourceTypeLine;
+                }
+                else if (localIndex > cutPS) //20260521
+                {
+                    caseswitch = Consts.SourceTypePortal;
+                }
+
+                int i = 0; // number of actual source
+
+                switch (caseswitch)
+                {
+                    //particle coordinates of point sources
+                    case Consts.SourceTypePoint:
+                        {
+                            AHint = 0;
+                            for (int j = 1; j <= Program.PS_Count; j++)
+                            {
+                                sumanz += Program.PS_PartNumb[j];
+                                if (localIndex <= sumanz) // found the source //20260521
+                                {
+                                    i = j;
+                                    break;
+                                }
+                            }
+
+                            if (i > 0)
+                            {
+                                zuff1 = DeterministicRng(ref m_z, ref m_w);
+
+                                double radius = Program.PS_D[i] * 0.5 * zuff1;
+
+                                zuff1 = DeterministicRng(ref m_z, ref m_w);
+
+                                double theta = 6.28 * zuff1;
+                                Program.Xcoord[nteil] = Program.PS_X[i] + radius * Math.Cos(theta);
+                                Program.YCoord[nteil] = Program.PS_Y[i] + radius * Math.Sin(theta);
+                                Program.ZCoord[nteil] = Program.PS_effqu[i];
+
+                                //in complex terrain z-coordinate is placed onto actual model height
+                                double xsi = Program.Xcoord[nteil] - Program.IKOOAGRAL;
+                                double eta = Program.YCoord[nteil] - Program.JKOOAGRAL;
+                                if ((eta <= Program.EtaMinGral) || (xsi <= Program.XsiMinGral) || (eta >= Program.EtaMaxGral) || (xsi >= Program.XsiMaxGral))
+                                { }
+                                else
+                                {
+                                    Program.ParticleSource[nteil] = i; // number of source
+                                    Program.SourceType[nteil] = Consts.SourceTypePoint; // Point Source
+                                    Program.ParticleSG[nteil] = Program.PS_SG[i];
+                                    Program.ParticleMode[nteil] = Program.PS_Mode[i]; // deposition mode
+
+                                    //Concentration only _______________________________________________
+                                    if (Program.PS_Mode[i] == Consts.DepoOff)  // concentration, no deposition
+                                    {
+                                        Program.ParticleMass[nteil] = Program.PS_ER[i] / Program.PS_PartNumb[i] * Volume_Time_Unit;
+
+                                        Program.ParticleVdep[nteil] = 0;
+                                        Program.ParticleVsed[nteil] = 0;
+                                    }
+                                    //Concentration + Deposition _______________________________________
+                                    else if (Program.PS_Mode[i] == Consts.DepoAndConc) // concentration and deposition
+                                    {
+                                        Program.ParticleMass[nteil] = Program.PS_ER[i] / Program.PS_PartNumb[i] * Volume_Time_Unit;
+
+                                        Program.ParticleVdep[nteil] = Program.PS_V_Dep[i];
+                                        Program.ParticleVsed[nteil] = Program.PS_V_sed[i];
+                                    }
+                                    //Deposition only ___________________________________________________
+                                    else if (Program.PS_Mode[i] == Consts.DepoOnly) // deposition only
+                                    {
+                                        Program.ParticleMass[nteil] = Program.PS_ER_Dep[i] / Program.PS_PartNumb[i] * 1000000000 / Program.GridVolume / Program.TAUS; // Paricle mass for deposition depending to the particle number of this source
+                                                                                                                                                                      //										Console.WriteLine(Program.Part_Mass[nteil] + " / " + Program.PS_PartNumb[i] + " / " + Program.PS_ER_Dep[i] + " / TAUS " + Program.TAUS + "/ dV " + Program.dV);
+                                        Program.ParticleVdep[nteil] = Program.PS_V_Dep[i];
+                                        Program.ParticleVsed[nteil] = Program.PS_V_sed[i];
+                                    }
+                                }
+
+                                if ((Program.Topo == Consts.TerrainAvailable) && (Program.BuildingsExist == true))
+                                {
+                                    int IndexI = (int)(xsi / Program.DXK) + 1;
+                                    int IndexJ = (int)(eta / Program.DYK) + 1;
+                                    Program.ZCoord[nteil] = Program.PS_effqu[i] - Program.CUTK[IndexI][IndexJ];
+                                    AHint = Program.AHK[IndexI][IndexJ];
+                                }
+                                else if ((Program.Topo == Consts.TerrainFlat) && (Program.BuildingsExist == true))
+                                {
+                                    int IndexI = (int)(xsi / Program.DXK) + 1;
+                                    int IndexJ = (int)(eta / Program.DYK) + 1;
+                                    if (Program.ZCoord[nteil] <= Program.HOKART[Program.KKART[IndexI][IndexJ]])
+                                    {
+                                        Program.ZCoord[nteil] = Program.HOKART[Program.KKART[IndexI][IndexJ]] + 0.1F;
+                                    }
+
+                                    AHint = Program.AHK[IndexI][IndexJ];
+                                }
+                                if (Program.ZCoord[nteil] <= AHint)
+                                {
+                                    Program.ZCoord[nteil] = AHint + 0.1F;
+                                }
+                            }
+                            else
+                            { }
+                            break;
+                        }
+
+                    //particle coordinates of portal sources
+                    case Consts.SourceTypePortal:
+                        {
+                            sumanz = Program.PS_PartSum;
+                            AHint = 0;
+                            for (int j = 1; j <= Program.TS_Count; j++)
+                            {
+                                sumanz += Program.TS_PartNumb[j];
+                                if (localIndex <= sumanz) // found the source //20260521
+                                {
+                                    i = j;
+                                    break;
+                                }
+                            }
+                            if (i > 0)
+                            {
+                                zuff1 = DeterministicRng(ref m_z, ref m_w);
+
+                                double zahl1 = Program.TS_Height[i] * zuff1;
+
+                                zuff1 = DeterministicRng(ref m_z, ref m_w);
+
+                                double zahl2 = Program.TS_Width[i] * zuff1;
+
+                                Program.ZCoord[nteil] = (float)(Math.Min(Program.TS_Z1[i], Program.TS_Z2[i]) + zahl1);
+                                Program.ParticleSource[nteil] = i;
+                                Program.SourceType[nteil] = Consts.SourceTypePortal; // Portals
+                                Program.ParticleSG[nteil] = Program.TS_SG[i];
+
+                                Program.ParticleMode[nteil] = Program.TS_Mode[i]; // deposition mode
+
+                                //Concentration only _______________________________________________
+                                if (Program.TS_Mode[i] ==  Consts.DepoOff)  // concentration, no deposition
+                                {
+                                    Program.ParticleMass[nteil] = Program.TS_ER[i] / Program.TS_PartNumb[i] * Volume_Time_Unit;
+
+                                    Program.ParticleVdep[nteil] = 0;
+                                    Program.ParticleVsed[nteil] = 0;
+                                }
+                                //Concentration + Deposition _______________________________________
+                                else if (Program.TS_Mode[i] == Consts.DepoAndConc) // concentration and deposition
+                                {
+                                    Program.ParticleMass[nteil] = Program.TS_ER[i] / Program.TS_PartNumb[i] * Volume_Time_Unit;
+
+                                    Program.ParticleVdep[nteil] = Program.TS_V_Dep[i];
+                                    Program.ParticleVsed[nteil] = Program.TS_V_sed[i];
+                                }
+                                //Deposition only ___________________________________________________
+                                else if (Program.TS_Mode[i] == Consts.DepoOnly) // deposition only
+                                {
+                                    Program.ParticleMass[nteil] = Program.TS_ER_Dep[i] / Program.TS_PartNumb[i] * 1000000000 / Program.GridVolume / Program.TAUS; // Paricle mass for deposition depending to the particle number of this source
+                                    Program.ParticleVdep[nteil] = Program.TS_V_Dep[i];
+                                    Program.ParticleVsed[nteil] = Program.TS_V_sed[i];
+                                }
+
+                                double x1 = -zahl2 * Program.TS_sinalpha[i];
+                                double y1 = zahl2 * Program.TS_cosalpha[i];
+                                double xb = Program.TS_Width[i] * 0.5 * Program.TS_sinalpha[i];
+                                double yb = Program.TS_Width[i] * 0.5 * Program.TS_cosalpha[i];
+                                double xv = 0.5 * (Program.TS_X1[i] + Program.TS_X2[i]) + xb;
+                                double yv = 0.5 * (Program.TS_Y1[i] + Program.TS_Y2[i]) - yb;
+                                Program.Xcoord[nteil] = xv + x1;
+                                Program.YCoord[nteil] = yv + y1;
+
+                                //in complex terrain z-coordinate is placed onto actual model height
+                                double xsi = Program.Xcoord[nteil] - Program.IKOOAGRAL;
+                                double eta = Program.YCoord[nteil] - Program.JKOOAGRAL;
+                                double xsi1 = Program.Xcoord[nteil] - Program.GrammWest;
+                                double eta1 = Program.YCoord[nteil] - Program.GrammSouth;
+                                if ((eta <= Program.EtaMinGral) || (xsi <= Program.XsiMinGral) || (eta >= Program.EtaMaxGral) || (xsi >= Program.XsiMaxGral))
+                                { }
+                                else
+                                {
+                                    if (Program.Topo == Consts.TerrainAvailable)
+                                    {
+                                        int IndexI = (int)(xsi / Program.DXK) + 1;
+                                        int IndexJ = (int)(eta / Program.DYK) + 1;
+                                        AHint = Program.AHK[IndexI][IndexJ];
+                                    }
+
+                                    // input = absolute height?
+                                    if (Program.TS_Absolute_Height[i])
+                                    {
+                                        if (Program.ZCoord[nteil] < AHint) // if absolute height < surface
+                                        {
+                                            Program.ZCoord[nteil] = AHint + 0.1F;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        Program.ZCoord[nteil] += AHint + 0.1F; // compute abs. height
+                                    }
+
+                                    if ((Program.Topo == Consts.TerrainFlat) && (Program.BuildingsExist == true))
+                                    {
+                                        int IndexI = (int)(xsi / Program.DXK) + 1;
+                                        int IndexJ = (int)(eta / Program.DYK) + 1;
+                                        if (Program.ZCoord[nteil] <= Program.HOKART[Program.KKART[IndexI][IndexJ]])
+                                        {
+                                            Program.ZCoord[nteil] = Program.HOKART[Program.KKART[IndexI][IndexJ]] + 0.1F;
+                                        }
+
+                                        AHint = Program.AHK[IndexI][IndexJ];
+                                    }
+
+                                }
+                            }
+                            else
+                            { }
+                            break;
+                        }
+
+                    //particle coordinates of line sources
+                    case Consts.SourceTypeLine:
+                        {
+                            sumanz = Program.PS_PartSum + Program.TS_PartSum;
+                            AHint = 0;
+                            for (int j = 1; j <= Program.LS_Count; j++)
+                            {
+                                sumanz += Program.LS_PartNumb[j];
+                                if (localIndex <= sumanz) // found the source //20260521
+                                {
+                                    i = j;
+                                    break;
+                                }
+                            }
+                            if (i > 0)
+                            {
+                                Program.ParticleSource[nteil] = i;
+                                Program.ParticleSG[nteil] = Program.LS_SG[i];
+                                Program.SourceType[nteil] = Consts.SourceTypeLine; // Line Source
+                                Program.ParticleMode[nteil] = Program.LS_Mode[i]; // deposition mode
+
+                                //Concentration only _______________________________________________
+                                if (Program.LS_Mode[i] == Consts.DepoOff)  // concentration, no deposition
+                                {
+                                    Program.ParticleMass[nteil] = Program.LS_ER[i] / Program.LS_PartNumb[i] * Volume_Time_Unit;
+
+                                    Program.ParticleVdep[nteil] = 0;
+                                    Program.ParticleVsed[nteil] = 0;
+                                }
+                                //Concentration + Deposition _______________________________________
+                                else if (Program.LS_Mode[i] == Consts.DepoAndConc) // concentration and deposition
+                                {
+                                    Program.ParticleMass[nteil] = Program.LS_ER[i] / Program.LS_PartNumb[i] * Volume_Time_Unit;
+
+                                    Program.ParticleVdep[nteil] = Program.LS_V_Dep[i];
+                                    Program.ParticleVsed[nteil] = Program.LS_V_sed[i];
+                                }
+                                //Deposition only ___________________________________________________
+                                else if (Program.LS_Mode[i] == Consts.DepoOnly) // deposition only
+                                {
+                                    Program.ParticleMass[nteil] = Program.LS_ER_Dep[i] / Program.LS_PartNumb[i] * 1000000000 / Program.GridVolume / Program.TAUS; // Particle mass for deposition depending to the particle number of this source
+                                    Program.ParticleVdep[nteil] = Program.LS_V_Dep[i];
+                                    Program.ParticleVsed[nteil] = Program.LS_V_sed[i];
+                                }
+
+                                double lang = Math.Sqrt(Math.Pow(Program.LS_X2[i] - Program.LS_X1[i], 2) +
+                                                        Math.Pow(Program.LS_Y2[i] - Program.LS_Y1[i], 2));
+                                double zzz = 0;   // z value
+                                double zahl1 = 0; // vertical mixing height
+
+                                if (lang > 0.1)
+                                {
+                                    // default case: horizontal line source 
+                                    zuff1 = DeterministicRng(ref m_z, ref m_w);
+
+                                    double zahl0 = lang * zuff1;
+                                    //noise abatement wall +1m
+                                    if (Program.LS_Laerm[i] > 0)
+                                    {
+                                        zuff1 = DeterministicRng(ref m_z, ref m_w);
+
+                                        zahl1 = Program.LS_Laerm[i] + zuff1;
+                                    }
+                                    //user defined volume for initial mixing of particles (traffic induced turbulence)
+                                    else if (Program.LS_Laerm[i] < 0)
+                                    {
+                                        zuff1 = DeterministicRng(ref m_z, ref m_w);
+                                        zahl1 = zuff1 * Math.Abs(Program.LS_Laerm[i]);
+                                    }
+                                    //standard initial mixing is up to 3m
+                                    else if (Program.LS_Laerm[i] == 0)
+                                    {
+                                        zuff1 = DeterministicRng(ref m_z, ref m_w);
+                                        zahl1 = 3 * zuff1;
+                                    }
+                                    zuff1 = DeterministicRng(ref m_z, ref m_w);
+
+                                    double zahl2 = Program.LS_Width[i] * zuff1;
+
+                                    //rotation of coordinate system
+                                    double alpha = (Program.LS_X2[i] - Program.LS_X1[i]) / lang;
+                                    double beta = (Program.LS_Y2[i] - Program.LS_Y1[i]) / lang;
+                                    double x1 = zahl0 * alpha - zahl2 * beta;
+                                    double y1 = zahl0 * beta + zahl2 * alpha;
+
+                                    //transformation of coordinate system
+                                    double xb = Program.LS_Width[i] * 0.5 * beta;
+                                    double yb = Program.LS_Width[i] * 0.5 * alpha;
+                                    double xv = Program.LS_X1[i] + xb;
+                                    double yv = Program.LS_Y1[i] - yb;
+                                    Program.Xcoord[nteil] = xv + x1;
+                                    Program.YCoord[nteil] = yv + y1;
+                                    zzz = Program.LS_Z1[i] + (Program.LS_Z2[i] - Program.LS_Z1[i]) / lang * zahl0;
+                                }
+                                else
+                                {
+                                    // special case: vertical line source
+                                    float _vertExt = Program.LS_Laerm[i];
+                                    if (_vertExt < 0)
+                                    {
+                                        // use vertical extension as radius
+                                        Program.Xcoord[nteil] = Program.LS_X1[i] + (1 - DeterministicRng(ref m_z, ref m_w) * 2) * _vertExt; // (-1 to 1) * VertExt
+                                        Program.YCoord[nteil] = Program.LS_Y1[i] + (1 - DeterministicRng(ref m_z, ref m_w) * 2) * _vertExt; // (-1 to 1) * VertExt
+                                    }
+                                    else
+                                    {
+                                        // vertical Line source without radius
+                                        Program.Xcoord[nteil] = Program.LS_X1[i];
+                                        Program.YCoord[nteil] = Program.LS_Y1[i];
+                                    }
+                                    zuff1 = DeterministicRng(ref m_z, ref m_w);
+                                    zzz = Program.LS_Z1[i] + (Program.LS_Z2[i] - Program.LS_Z1[i]) * zuff1;
+                                }
+
+                                //in complex terrain z-coordinate is placed onto actual model height
+                                double xsi = Program.Xcoord[nteil] - Program.IKOOAGRAL;
+                                double eta = Program.YCoord[nteil] - Program.JKOOAGRAL;
+                                double xsi1 = Program.Xcoord[nteil] - Program.GrammWest;
+                                double eta1 = Program.YCoord[nteil] - Program.GrammSouth;
+                                if ((eta <= Program.EtaMinGral) || (xsi <= Program.XsiMinGral) || (eta >= Program.EtaMaxGral) || (xsi >= Program.XsiMaxGral))
+                                { }
+                                else
+                                {
+                                    if (Program.Topo == Consts.TerrainAvailable)
+                                    {
+                                        int IndexI = (int)(xsi / Program.DXK) + 1;
+                                        int IndexJ = (int)(eta / Program.DYK) + 1;
+                                        AHint = Program.AHK[IndexI][IndexJ];
+                                    }
+
+                                    // input = absolute height? - do nothing -otherwise compute abs. height
+                                    if (Program.LS_Absolute_Height[i] == false)
+                                    {
+                                        zzz += AHint; // compute absolute height 
+                                    }
+
+                                    if (zzz <= (AHint + 0.01F)) // set source to the surface
+                                    {
+                                        zzz = AHint + 0.01F;
+                                    }
+
+                                    if ((Program.Topo == Consts.TerrainFlat) && (Program.BuildingsExist == true))
+                                    {
+                                        int IndexI = (int)(xsi / Program.DXK) + 1;
+                                        int IndexJ = (int)(eta / Program.DYK) + 1;
+                                        if (zzz <= Program.HOKART[Program.KKART[IndexI][IndexJ]])
+                                        {
+                                            zzz = Program.HOKART[Program.KKART[IndexI][IndexJ]] + 0.1F;
+                                        }
+
+                                        AHint = Program.AHK[IndexI][IndexJ];
+                                    }
+
+                                    Program.ZCoord[nteil] = (float)(zzz + zahl1) + 0.1F;
+                                    //Console.WriteLine(i.ToString() + "/" +Program.Part_Mass[nteil].ToString() +"/" + Program.xcoord[nteil].ToString() +"/" + Program.ycoord[nteil].ToString() +"/" +Program.zcoord[nteil].ToString());
+                                }
+                            }
+                            else
+                            { }
+                            break;
+                        }
+
+                    //particle coordinates of area sources
+                    case Consts.SourceTypeArea:
+                        {
+                            sumanz = Program.PS_PartSum + Program.TS_PartSum + Program.LS_PartSum;
+                            AHint = 0;
+                            for (int j = 1; j <= Program.AS_Count; j++)
+                            {
+                                sumanz += Program.AS_PartNumb[j];
+                                if (localIndex <= sumanz) // found the source //20260521
+                                {
+                                    i = j;
+                                    break;
+                                }
+                            }
+                            if (i > 0)
+                            {
+                                Program.ParticleSource[nteil] = i;
+                                Program.ParticleSG[nteil] = Program.AS_SG[i];
+                                Program.SourceType[nteil] = Consts.SourceTypeArea; // Area Source
+                                Program.ParticleMode[nteil] = Program.AS_Mode[i]; // deposition mode
+
+                                //Concentration only _______________________________________________
+                                if (Program.AS_Mode[i] == Consts.DepoOff)  // concentration, no deposition
+                                {
+                                    Program.ParticleMass[nteil] = Program.AS_ER[i] / Program.AS_PartNumb[i] * Volume_Time_Unit;
+
+                                    Program.ParticleVdep[nteil] = 0;
+                                    Program.ParticleVsed[nteil] = 0;
+                                }
+                                //Concentration + Deposition _______________________________________
+                                else if (Program.AS_Mode[i] == Consts.DepoAndConc) // concentration and deposition
+                                {
+                                    Program.ParticleMass[nteil] = Program.AS_ER[i] / Program.AS_PartNumb[i] * Volume_Time_Unit;
+
+                                    Program.ParticleVdep[nteil] = Program.AS_V_Dep[i];
+                                    Program.ParticleVsed[nteil] = Program.AS_V_sed[i];
+                                }
+                                //Deposition only ___________________________________________________
+                                else if (Program.AS_Mode[i] == Consts.DepoOnly) // deposition only
+                                {
+                                    Program.ParticleMass[nteil] = Program.AS_ER_Dep[i] / Program.AS_PartNumb[i] * 1000000000 / Program.GridVolume / Program.TAUS; // Paricle mass for deposition depending to the particle number of this source
+                                    Program.ParticleVdep[nteil] = Program.AS_V_Dep[i];
+                                    Program.ParticleVsed[nteil] = Program.AS_V_sed[i];
+                                }
+
+                                zuff1 = DeterministicRng(ref m_z, ref m_w);
+
+                                double zahl0 = Program.AS_dX[i] * zuff1;
+
+                                zuff1 = DeterministicRng(ref m_z, ref m_w);
+
+                                double zahl1 = Program.AS_dZ[i] * zuff1;
+
+                                zuff1 = DeterministicRng(ref m_z, ref m_w);
+                                double zahl2 = Program.AS_dY[i] * zuff1;
+
+                                Program.Xcoord[nteil] = Program.AS_X[i] - Program.AS_dX[i] * 0.5F + zahl0;
+                                Program.YCoord[nteil] = Program.AS_Y[i] - Program.AS_dY[i] * 0.5F + zahl2;
+                                double zzz = Program.AS_Z[i] - Program.AS_dZ[i] * 0.5F;
+
+                                //in complex terrain z-coordinate is placed onto actual model height
+                                double xsi = Program.Xcoord[nteil] - Program.IKOOAGRAL;
+                                double eta = Program.YCoord[nteil] - Program.JKOOAGRAL;
+                                double xsi1 = Program.Xcoord[nteil] - Program.GrammWest;
+                                double eta1 = Program.YCoord[nteil] - Program.GrammSouth;
+                                if ((eta <= Program.EtaMinGral) || (xsi <= Program.XsiMinGral) || (eta >= Program.EtaMaxGral) || (xsi >= Program.XsiMaxGral))
+                                { }
+                                else
+                                {
+                                    int IndexI = 1;
+                                    int IndexJ = 1;
+                                    if (Program.Topo == Consts.TerrainAvailable)
+                                    {
+                                        IndexI = (int)(xsi / Program.DXK) + 1;
+                                        IndexJ = (int)(eta / Program.DYK) + 1;
+                                        AHint = Program.AHK[IndexI][IndexJ];
+                                    }
+
+                                    // input = absolute height? -> do nothing, otherwise compute absolute height
+                                    if (Program.AS_Absolute_Height[i] == false)
+                                    {
+                                        zzz += AHint;
+                                    }
+
+                                    if ((Program.Topo == Consts.TerrainAvailable) && (Program.BuildingsExist == true))
+                                    {
+                                        zzz -= Program.CUTK[IndexI][IndexJ];
+                                    }
+
+                                    if (zzz <= AHint)
+                                    {
+                                        zzz = AHint + 0.01F;
+                                    }
+
+                                    if ((Program.Topo == Consts.TerrainFlat) && (Program.BuildingsExist == true))
+                                    {
+                                        IndexI = (int)(xsi / Program.DXK) + 1;
+                                        IndexJ = (int)(eta / Program.DYK) + 1;
+                                        if (zzz <= Program.HOKART[Program.KKART[IndexI][IndexJ]])
+                                        {
+                                            zzz = Program.HOKART[Program.KKART[IndexI][IndexJ]] + 0.1F;
+                                        }
+
+                                        AHint = Program.AHK[IndexI][IndexJ];
+                                    }
+
+                                    Program.ZCoord[nteil] = (float)(zzz + zahl1) + 0.1F;
+                                }
+                            }
+                            else
+                            { }
+                            break;
+                        }
+                    //particle coordinates of volume sources
+                    case Consts.SourceTypeVolume:
+                        {
+                            sumanz = Program.PS_PartSum + Program.TS_PartSum + Program.LS_PartSum + Program.AS_PartSum;
+                            AHint = 0;
+
+                            for (int j = 1; j <= Program.VS_Count; j++)
+                            {
+                                sumanz += Program.VS_PartNumb[j];
+                                if (localIndex <= sumanz) //20260521
+                                {
+                                    i = j;
+                                    break;
+                                }
+                            }
+
+                            if (i > 0)
+                            {
+                                if (vsReleaseThisStep != null && !vsReleaseThisStep[i])
+                                {
+                                    break; // 本步不释放该瞬时源
+                                }
+
+                                Program.ParticleSource[nteil] = i;
+                                Program.SourceType[nteil] = Consts.SourceTypeVolume;
+                                Program.ParticleSG[nteil] = Program.VS_SG[i];
+                                Program.ParticleMode[nteil] = Program.VS_Mode[i];
+
+                                double erForMass = GetVSEmissionRateKgPerH(i);
+
+                                if (Program.VS_Mode[i] == Consts.DepoOff)
+                                {
+                                    Program.ParticleMass[nteil] = erForMass / Program.VS_PartNumb[i] * Volume_Time_Unit;
+                                    Program.ParticleVdep[nteil] = 0;
+                                    Program.ParticleVsed[nteil] = 0;
+                                }
+                                else if (Program.VS_Mode[i] == Consts.DepoAndConc)
+                                {
+                                    Program.ParticleMass[nteil] = erForMass / Program.VS_PartNumb[i] * Volume_Time_Unit;
+                                    Program.ParticleVdep[nteil] = Program.VS_V_Dep[i];
+                                    Program.ParticleVsed[nteil] = Program.VS_V_sed[i];
+                                }
+                                else // DepoOnly
+                                {
+                                    Program.ParticleMass[nteil] = Program.VS_ER_Dep[i] / Program.VS_PartNumb[i] * 1000000000 / Program.GridVolume / Program.TAUS;
+                                    Program.ParticleVdep[nteil] = Program.VS_V_Dep[i];
+                                    Program.ParticleVsed[nteil] = Program.VS_V_sed[i];
+                                }
+
+                                SampleVolumePoint(i, ref m_z, ref m_w, out double xVol, out double yVol, out double zzz);
+                                Program.Xcoord[nteil] = xVol;
+                                Program.YCoord[nteil] = yVol;
+
+                                double xsi = Program.Xcoord[nteil] - Program.IKOOAGRAL;
+                                double eta = Program.YCoord[nteil] - Program.JKOOAGRAL;
+                                if ((eta <= Program.EtaMinGral) || (xsi <= Program.XsiMinGral) || (eta >= Program.EtaMaxGral) || (xsi >= Program.XsiMaxGral))
+                                {
+                                    Program.ParticleSource[nteil] = 0;
+                                    Program.ParticleMass[nteil] = 0;
+                                    break;
+                                }
+
+                                int IndexI = (int)(xsi / Program.DXK) + 1;
+                                int IndexJ = (int)(eta / Program.DYK) + 1;
+
+                                if (Program.Topo == Consts.TerrainAvailable)
+                                {
+                                    AHint = Program.AHK[IndexI][IndexJ];
+                                }
+
+                                if (!Program.VS_Absolute_Height[i])
+                                {
+                                    zzz += AHint;
+                                }
+
+                                if ((Program.Topo == Consts.TerrainAvailable) && Program.BuildingsExist)
+                                {
+                                    zzz -= Program.CUTK[IndexI][IndexJ];
+                                }
+
+                                if ((Program.Topo == Consts.TerrainFlat) && Program.BuildingsExist)
+                                {
+                                    if (zzz <= Program.HOKART[Program.KKART[IndexI][IndexJ]])
+                                    {
+                                        zzz = Program.HOKART[Program.KKART[IndexI][IndexJ]] + 0.1F;
+                                    }
+                                }
+
+                                if (zzz <= AHint)
+                                {
+                                    zzz = AHint + 0.01F;
+                                }
+
+                                Program.ZCoord[nteil] = (float)zzz + 0.1F;
+                            }
+                            break;
+                        }
+                }
+                if (Program.ParticleSource[nteil] > 0 && Program.ParticleMass[nteil] > 0) //20260521
+                {
+                    float particleEmissionFactor = emissionFactor; //20260521
+                    if (Program.TransientReleaseEnabled) //20260521
+                    {
+                        particleEmissionFactor = Program.GetEmissionFactorForSourceGroup(Program.IWET, Program.ParticleSG[nteil], emissionFactor);
+                    }
+
+                    if (particleEmissionFactor <= 0f) //20260521
+                    {
+                        Program.ParticleSource[nteil] = 0;
+                        Program.ParticleMass[nteil] = 0;
+                    }
+                    else
+                    {
+                        Program.ParticleMass[nteil] *= particleEmissionFactor; //20260521
+                        if (Program.GasBuoyancyMode != 0 && Program.DenseStates != null && nteil < Program.DenseStates.Length) //20260521
+                        {
+                            Program.DenseStates[nteil] = Program.CreateInitialDenseGasState(); //20260521
+                        }
+                    }
+                }
+            });
+            //每步实际释放统计20260310
+            if (Program.VS_Count > 0)
+            {
+                int releasedParticles = 0;
+                double massRateSum = 0.0;
+
+                for (int n = globalStartInclusive; n < globalEnd; n++) //20260521
+                {
+                    if (Program.SourceType[n] == Consts.SourceTypeVolume &&
+                        Program.ParticleSource[n] > 0 &&
+                        Program.ParticleMass[n] > 0)
+                    {
+                        releasedParticles++;
+                        massRateSum += Program.ParticleMass[n];
+                    }
+                }
+
+                Console.WriteLine($"[VS_RELEASE] IWET={Program.IWET} particles={releasedParticles} massRateSum={massRateSum:E3}");
+            }
+
+
+            // Transient Mode: calculate average deposition settings for each source group one times (if Transient_Depo == null)
+            if (Program.ISTATIONAER == Consts.TransientMode && Program.TransientDepo == null)
+            {
+                Program.TransientDepo = new TransientDeposition[Program.SourceGroups.Count];
+                for (int i = 0; i < Program.SourceGroups.Count; i++)
+                {
+                    Program.TransientDepo[i] = new TransientDeposition();
+                }
+
+                int[] mode = new int[Program.SourceGroups.Count];
+                int[] counter = new int[Program.SourceGroups.Count];
+                double[] vsed = new double[Program.SourceGroups.Count];
+                double[] vdep = new double[Program.SourceGroups.Count];
+
+                // loop over all particles
+                for (int nteil = globalStartInclusive; nteil < globalEnd; nteil++) //20260521
+                {
+                    if (Program.ParticleSource[nteil] > 0 && Program.ParticleMode[nteil] < Consts.DepoOnly) // no deposition weighting if only deposition should be calculated for a particle //20260521
+                    {
+                        int SG = Program.ParticleSG[nteil]; // real SG number of particle
+                        int SG_index = Program.SourceGroups.IndexOf(Program.ParticleSG[nteil]); // internal source group number 
+                        if (SG_index < 0) //20260521
+                        {
+                            continue;
+                        }
+                        mode[SG_index] = Math.Max(mode[SG_index], Program.ParticleMode[nteil]); // set average mode to 1 if 1 particle has a deposition
+                        vdep[SG_index] += Program.ParticleVdep[nteil];
+                        vsed[SG_index] += Program.ParticleVsed[nteil];
+                        ++counter[SG_index];
+                    }
+                }
+
+                // Set average deposition values for each source group
+                for (int i = 0; i < Program.SourceGroups.Count; i++)
+                {
+                    Program.TransientDepo[i].DepositionMode = 0;
+                    if (counter[i] > 0)
+                    {
+                        Program.TransientDepo[i].Vdep = vdep[i] / counter[i];
+                        Program.TransientDepo[i].Vsed = vsed[i] / counter[i];
+                        Program.TransientDepo[i].DepositionMode = mode[i];
+                    }
+                }
+            } // Transient Mode: average depo settings
+
+        }
+
+        private static void SampleVolumePoint(int i, ref uint m_z, ref uint m_w, out double x, out double y, out double z)
+        {
+            byte shape = Program.VS_Shape[i];
+
+            if (shape == 1) // Box
+            {
+                double dx = Math.Max(1e-6, Program.VS_DX[i]);
+                double dy = Math.Max(1e-6, Program.VS_DY[i]);
+                double dz = Math.Max(1e-6, Program.VS_DZ[i]);
+
+                double ux = DeterministicRng(ref m_z, ref m_w);
+                double uy = DeterministicRng(ref m_z, ref m_w);
+                double uz = DeterministicRng(ref m_z, ref m_w);
+
+                x = Program.VS_X[i] + (ux - 0.5) * dx;
+                y = Program.VS_Y[i] + (uy - 0.5) * dy;
+                z = (Program.VS_ZRef[i] == 1) ? (Program.VS_Z[i] + uz * dz) : (Program.VS_Z[i] + (uz - 0.5) * dz);
+                return;
+            }
+
+            if (shape == 3) // Sphere
+            {
+                double r = Math.Max(1e-6, Program.VS_R[i]);
+                double u1 = DeterministicRng(ref m_z, ref m_w);
+                double u2 = DeterministicRng(ref m_z, ref m_w);
+                double u3 = DeterministicRng(ref m_z, ref m_w);
+
+                double rr = r * Math.Pow(u1, 1.0 / 3.0);
+                double cosT = 2.0 * u2 - 1.0;
+                double sinT = Math.Sqrt(Math.Max(0.0, 1.0 - cosT * cosT));
+                double phi = 2.0 * Math.PI * u3;
+
+                x = Program.VS_X[i] + rr * sinT * Math.Cos(phi);
+                y = Program.VS_Y[i] + rr * sinT * Math.Sin(phi);
+                z = Program.VS_Z[i] + rr * cosT;
+                return;
+            }
+
+            // Cylinder (default)
+            double rad = Math.Max(1e-6, Program.VS_R[i]);
+            double h = Math.Max(1e-6, Program.VS_H[i]);
+
+            double ur = DeterministicRng(ref m_z, ref m_w);
+            double uth = DeterministicRng(ref m_z, ref m_w);
+            double uzc = DeterministicRng(ref m_z, ref m_w);
+
+            double rrC = rad * Math.Sqrt(ur);
+            double theta = 2.0 * Math.PI * uth;
+
+            x = Program.VS_X[i] + rrC * Math.Cos(theta);
+            y = Program.VS_Y[i] + rrC * Math.Sin(theta);
+            z = (Program.VS_ZRef[i] == 1) ? (Program.VS_Z[i] + uzc * h) : (Program.VS_Z[i] - 0.5 * h + uzc * h);
+        }
+
+        private static double GetVSEmissionRateKgPerH(int i)
+        {
+            if (Program.VS_Instant[i])
+            {
+                double totalKg = (Program.VS_TotalRelease != null && i < Program.VS_TotalRelease.Length)
+                    ? Math.Max(0.0, Program.VS_TotalRelease[i])
+                    : 0.0;
+                return totalKg * 3600.0 / Math.Max(1e-6, Program.TAUS);
+            }
+            return Math.Max(0.0, Program.VS_ER[i]);
+        }
+
+        public static float DeterministicRng(ref uint m_z, ref uint m_w)
+        {
+            m_z = 36969 * (m_z & 65535) + (m_z >> 16);
+            m_w = 18000 * (m_w & 65535) + (m_w >> 16);
+            return(((m_z << 16) + m_w + 1) * RNG_Const);
+        }
+    }
+}
